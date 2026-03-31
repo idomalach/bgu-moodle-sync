@@ -1,0 +1,14 @@
+# Personal config (contains your course IDs and local paths)
+moodle_sync_config.json
+
+# Sync state (generated at runtime)
+.moodle_manifest.json
+
+# macOS
+.DS_Store
+
+# Excel temp files
+~$*.xlsx
+
+# Downloaded course folders (this repo is just the engine, not the content)
+שנה*/
