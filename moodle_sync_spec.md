@@ -692,7 +692,16 @@ The entire download pipeline is encoded in a single JavaScript file (`moodle_syn
 ### How to Run
 
 1. Navigate to any `moodle.bgu.ac.il` page in Chrome (must be logged in).
-2. Inject `moodle_sync.js` via the browser console or Claude in Chrome's `javascript_tool`.
+2. Load the engine. Two options:
+   - **Manual (console):** Paste the contents of `moodle_sync.js` into the browser console.
+   - **Automated (Claude in Chrome):** First inject the config via `javascript_tool`, then load the engine via `fetch()` from GitHub:
+     ```javascript
+     // Inject config first
+     window.__MOODLE_SYNC_CONFIG__ = { /* ... config JSON ... */ };
+     // Then load engine from GitHub (do NOT inject the 47KB script directly — it corrupts during chunked transcription)
+     fetch('https://raw.githubusercontent.com/idomalach/bgu-moodle-sync/main/moodle_sync.js')
+       .then(r => r.text()).then(code => eval(code));
+     ```
 3. A sidebar appears on the right with two buttons: **Seed Run (Full)** and **Incremental Sync**.
 4. Click one. The browser's directory picker opens — point it to the root download folder (the parent of `שנה ג׳`).
 5. The engine scrapes all 5 courses, resolves URLs, expands folders, downloads files, saves the manifest, generates READMEs, and produces the Excel log. All automatically.
@@ -771,3 +780,33 @@ The engine loads two libraries from CDN at runtime (only when needed):
 - **JSZip** (v3.10.1) — for extracting ZIP archives.
 
 Both are loaded lazily: SheetJS only when generating the Excel file, JSZip only when a ZIP file is downloaded.
+
+---
+
+## Safety Rules (v2.2 — added 2026-04-03)
+
+These rules were added after an incident where the scheduled incremental sync re-downloaded every file because `loadManifest()` silently returned `{}` when the FUSE mount was deadlocked. The silent `catch { return {} }` in loadManifest was the single point of failure — an empty manifest in incremental mode is indistinguishable from a seed run.
+
+### S1 — Abort on empty manifest (incremental mode)
+
+If mode is `incremental` and the loaded manifest has 0 courses and 0 items, the engine throws immediately and refuses to proceed. This prevents blind full re-downloads when the manifest file is unreadable.
+
+### S2 — IndexedDB manifest backup
+
+After every successful sync, the manifest is saved to **both** the filesystem (`.moodle_manifest.json`) and **IndexedDB** (`MoodleSyncBackup` database, key `manifest`). On load, the engine tries the filesystem first; if that returns empty or fails, it falls back to the IndexedDB copy. This provides resilience against filesystem failures (FUSE deadlocks, permission issues, etc.).
+
+### S3 — IndexedDB directory handle cache
+
+After the first `showDirectoryPicker()` call, the returned `FileSystemDirectoryHandle` is stored in IndexedDB (key `directoryHandle`). On subsequent runs, the engine tries the cached handle first with `queryPermission({ mode: 'readwrite' })`. If granted, it skips the picker entirely. If permission was revoked, it calls `requestPermission()` to re-prompt. Only falls back to `showDirectoryPicker()` if the cached handle is unavailable. This eliminates the folder picker blocker for automated/scheduled runs.
+
+### S4 — Download count safety valve
+
+In incremental mode, after filtering the download queue: if the queue length exceeds **50% of total scraped items** AND is greater than **10 items**, the engine aborts. This catches cases where manifest corruption causes most items to appear "new" — which would otherwise trigger a mass re-download.
+
+### S5 — Login enforcement
+
+Before any sync operation, the engine checks for login buttons (`התחברות` / `Log in`) on the page and clicks them if found. It also checks for the user menu element to confirm login status. This addresses a subtle issue where the Moodle page can look like a dashboard (cached HTML) even when the session has expired. Running sync without login would produce empty course pages or redirect errors.
+
+### S6 — Config backup in IndexedDB
+
+The config object is saved to IndexedDB (key `config`) whenever it's loaded from `window.__MOODLE_SYNC_CONFIG__` or saved from the setup form. If config loading fails on a subsequent run (e.g., the injection didn't happen, the config file is unreachable), the engine falls back to the IndexedDB copy. This prevents the setup form from appearing unexpectedly during scheduled runs.

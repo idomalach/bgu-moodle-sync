@@ -1,5 +1,5 @@
 /**
- * BGU Moodle Sync Engine v2.1
+ * BGU Moodle Sync Engine v2.2 (safety patches S1–S6)
  *
  * Unified engine for both seed runs and incremental syncs.
  * Inject this into any Moodle tab, click the button, and it handles everything.
@@ -46,11 +46,24 @@
       const ext = window.__MOODLE_SYNC_CONFIG__;
       Object.assign(CONFIG, ext);
       log('Config loaded from window.__MOODLE_SYNC_CONFIG__');
+      // S6 — Backup config to IndexedDB
+      try { await idbSet('config', CONFIG); } catch {}
       return true;
     }
 
     // Option 2: Config loaded alongside the script via the semester folder
     // (The setup form will set this if the user fills it in)
+
+    // S6 — Fallback: try IndexedDB config backup
+    try {
+      const cachedConfig = await idbGet('config');
+      if (cachedConfig && cachedConfig.courses && cachedConfig.courses.length > 0) {
+        Object.assign(CONFIG, cachedConfig);
+        log('Config restored from IndexedDB backup');
+        return true;
+      }
+    } catch {}
+
     return false;
   }
 
@@ -611,25 +624,95 @@
   }
 
   // ============================================================
-  // MANIFEST MANAGEMENT
+  // INDEXEDDB HELPERS (S2, S3, S6 — backup & cache layer)
+  // ============================================================
+
+  function openIDB() {
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open('MoodleSyncBackup', 2);
+      req.onupgradeneeded = (e) => {
+        const db = e.target.result;
+        if (!db.objectStoreNames.contains('backups')) {
+          db.createObjectStore('backups');
+        }
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  async function idbGet(key) {
+    try {
+      const db = await openIDB();
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction('backups', 'readonly');
+        const store = tx.objectStore('backups');
+        const req = store.get(key);
+        req.onsuccess = () => resolve(req.result ?? null);
+        req.onerror = () => reject(req.error);
+      });
+    } catch (e) {
+      log(`  IDB read failed for "${key}": ${e.message}`);
+      return null;
+    }
+  }
+
+  async function idbSet(key, value) {
+    try {
+      const db = await openIDB();
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction('backups', 'readwrite');
+        const store = tx.objectStore('backups');
+        const req = store.put(value, key);
+        req.onsuccess = () => resolve();
+        req.onerror = () => reject(req.error);
+      });
+    } catch (e) {
+      log(`  IDB write failed for "${key}": ${e.message}`);
+    }
+  }
+
+  // ============================================================
+  // MANIFEST MANAGEMENT (patched: S1, S2)
   // ============================================================
 
   async function loadManifest(semesterHandle) {
+    // Try filesystem first
     try {
       const fh = await semesterHandle.getFileHandle('.moodle_manifest.json');
       const file = await fh.getFile();
       const text = await file.text();
-      return JSON.parse(text);
+      const manifest = JSON.parse(text);
+      if (manifest && Object.keys(manifest).length > 0) {
+        log('  Manifest loaded from filesystem');
+        return manifest;
+      }
     } catch {
-      return {};
+      // filesystem failed — fall through to IndexedDB
     }
+
+    // S2 — Fallback: try IndexedDB backup
+    log('  Filesystem manifest empty or missing — trying IndexedDB backup...');
+    const backup = await idbGet('manifest');
+    if (backup && Object.keys(backup).length > 0) {
+      log('  Manifest restored from IndexedDB backup');
+      return backup;
+    }
+
+    log('  No manifest found in filesystem or IndexedDB');
+    return {};
   }
 
   async function saveManifest(semesterHandle, manifest) {
+    // Save to filesystem
     const fh = await semesterHandle.getFileHandle('.moodle_manifest.json', { create: true });
     const writable = await fh.createWritable();
     await writable.write(JSON.stringify(manifest, null, 2));
     await writable.close();
+
+    // S2 — Also save to IndexedDB as backup
+    await idbSet('manifest', manifest);
+    log('  Manifest saved to filesystem + IndexedDB backup');
   }
 
   // ============================================================
@@ -753,10 +836,70 @@
     log('');
 
     try {
-      // Step 1: Get directory handle
-      log('Step 1/8: Requesting folder access...');
-      state.rootHandle = await showDirectoryPicker({ mode: 'readwrite' });
+      // S5 — Login enforcement: always click התחברות before proceeding
+      log('Step 0: Ensuring login...');
+      const loginBtn = document.querySelector('a[href*="login/index.php"], a.btn-login, a[data-title="login,moodle"]');
+      if (loginBtn) {
+        log('  Found login button — clicking...');
+        loginBtn.click();
+        await delay(3000);
+        log('  Login page triggered — please complete login, then re-run sync.');
+        state.running = false;
+        return;
+      }
+      // Also check for the Hebrew login link text
+      const allLinks = document.querySelectorAll('a');
+      for (const link of allLinks) {
+        if (link.textContent.trim() === 'התחברות' || link.textContent.trim() === 'Log in') {
+          log('  Found "התחברות" link — clicking...');
+          link.click();
+          await delay(3000);
+          log('  Login page triggered — please complete login, then re-run sync.');
+          state.running = false;
+          return;
+        }
+      }
+      // Verify we're actually logged in by checking for user menu
+      const userMenu = document.querySelector('.usermenu, .usertext, #user-menu-toggle, .logininfo .username');
+      if (!userMenu) {
+        log('  WARNING: Could not confirm login status — proceeding cautiously');
+      } else {
+        log('  Login confirmed');
+      }
 
+      // Step 1: Get directory handle (S3 — try cached handle first)
+      log('Step 1/8: Requesting folder access...');
+      let dirHandle = null;
+
+      // S3 — Try cached directory handle from IndexedDB
+      try {
+        const cachedHandle = await idbGet('directoryHandle');
+        if (cachedHandle) {
+          const perm = await cachedHandle.queryPermission({ mode: 'readwrite' });
+          if (perm === 'granted') {
+            dirHandle = cachedHandle;
+            log('  Using cached directory handle from IndexedDB');
+          } else {
+            const requested = await cachedHandle.requestPermission({ mode: 'readwrite' });
+            if (requested === 'granted') {
+              dirHandle = cachedHandle;
+              log('  Re-authorized cached directory handle');
+            }
+          }
+        }
+      } catch (e) {
+        log(`  Cached handle unavailable: ${e.message}`);
+      }
+
+      // Fall back to picker if no cached handle
+      if (!dirHandle) {
+        dirHandle = await showDirectoryPicker({ mode: 'readwrite' });
+        // S3 — Cache the handle for future runs
+        await idbSet('directoryHandle', dirHandle);
+        log('  Directory handle cached in IndexedDB for future runs');
+      }
+
+      state.rootHandle = dirHandle;
       const yearHandle = await state.rootHandle.getDirectoryHandle('שנה ג׳', { create: true });
       state.semesterHandle = await yearHandle.getDirectoryHandle('סמסטר ב׳', { create: true });
       log('  Folder access granted');
@@ -768,6 +911,8 @@
         await cfgWritable.write(JSON.stringify(window.__MOODLE_SYNC_CONFIG_PENDING__, null, 2));
         await cfgWritable.close();
         log('  Config saved to moodle_sync_config.json');
+        // S6 — Also backup config to IndexedDB
+        await idbSet('config', window.__MOODLE_SYNC_CONFIG_PENDING__);
         delete window.__MOODLE_SYNC_CONFIG_PENDING__;
       }
 
@@ -776,6 +921,24 @@
       state.manifest = await loadManifest(state.semesterHandle);
       const courseCount = Object.keys(state.manifest).length;
       log(`  Manifest loaded: ${courseCount} courses tracked`);
+
+      // S1 — Abort on empty manifest in incremental mode
+      if (mode === 'incremental' && courseCount === 0) {
+        const totalManifestItems = Object.values(state.manifest)
+          .reduce((sum, c) => sum + (c.items ? Object.keys(c.items).length : 0), 0);
+        if (totalManifestItems === 0) {
+          log('');
+          log('🛑 SAFETY ABORT: Incremental mode with EMPTY manifest.');
+          log('  An empty manifest in incremental mode means ALL files would be');
+          log('  re-downloaded (indistinguishable from a seed run).');
+          log('  This usually means the manifest file could not be read.');
+          log('');
+          log('  To fix: Run a SEED sync first, or check that the manifest file');
+          log('  (.moodle_manifest.json) exists and is readable.');
+          state.running = false;
+          return;
+        }
+      }
 
       // Step 3: Scrape all courses
       log('Step 3/8: Scraping courses...');
@@ -923,6 +1086,20 @@
         log(`  ${filtered.length} new items to download (${skippedCount} already in manifest)`);
         downloadQueue.length = 0;
         downloadQueue.push(...filtered);
+
+        // S4 — Download count safety valve
+        const totalScraped = allItems.length;
+        if (filtered.length > 10 && totalScraped > 0 && filtered.length > totalScraped * 0.5) {
+          log('');
+          log(`🛑 SAFETY ABORT: Incremental queue (${filtered.length}) exceeds 50% of`);
+          log(`  total scraped items (${totalScraped}). This looks like a full re-download.`);
+          log('  Possible causes: manifest corruption, manifest read failure, or');
+          log('  Moodle changed item IDs.');
+          log('');
+          log('  To proceed anyway, run a SEED sync instead.');
+          state.running = false;
+          return;
+        }
       } else {
         log('Step 5/8: Seed mode — downloading all items');
       }
@@ -1060,7 +1237,7 @@
     container.innerHTML = `
       <div style="padding:16px 18px;background:linear-gradient(135deg,#1565C0,#1976D2);color:white;">
         <h2 style="margin:0;font-size:18px;font-weight:700;">BGU Moodle Sync</h2>
-        <p style="margin:4px 0 0;opacity:0.8;font-size:11px;">v2.0 — One-click course material sync</p>
+        <p style="margin:4px 0 0;opacity:0.8;font-size:11px;">v2.2 — One-click course material sync (safety patches S1–S6)</p>
       </div>
       <div style="padding:14px 18px;display:flex;gap:10px;">
         <button id="sync-seed" style="flex:1;padding:12px 8px;background:#2E7D32;color:white;border:none;border-radius:8px;font-size:13px;cursor:pointer;font-weight:600;transition:opacity .15s;">
@@ -1208,7 +1385,7 @@
     const configLoaded = await loadConfig();
 
     if (configLoaded && CONFIG.courses.length > 0) {
-      log(`Sync engine v2.1 loaded. ${CONFIG.courses.length} courses configured.`);
+      log(`Sync engine v2.2 loaded. ${CONFIG.courses.length} courses configured.`);
       log('Choose a mode to begin.');
     } else {
       log('No config found — showing setup form...');
