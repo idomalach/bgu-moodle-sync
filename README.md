@@ -47,7 +47,7 @@ A blue sidebar appears on the right side of the page.
 Since this is your first run, the sidebar shows a setup form. Fill in:
 
 - **Semester identifier**: the text that appears in your course titles on Moodle (e.g. `סמ 2` for semester B, `סמ 1` for semester A)
-- **Root folder path**: the path inside your download folder (e.g. `שנה ג׳/סמסטר ב׳`)
+- **Semester folder name**: the semester folder inside the year folder you'll pick (e.g. `סמסטר ב׳`)
 - **Courses**: one per line, format: `COURSE_ID | Folder Name`
 
 Example:
@@ -63,7 +63,7 @@ Click **Save Config & Continue**.
 ### Step 4: Run the seed download
 
 1. Click **Seed Run (Full)**
-2. A folder picker opens — select the **parent** folder that contains your root path (e.g. select `Desktop` if your root path starts with `שנה ג׳`)
+2. A folder picker opens — select your **year folder** (e.g. `שנה ג׳`). The engine navigates into the semester subfolder automatically.
 3. Wait. The sidebar shows real-time progress. A full run of 5 courses takes about 2-3 minutes.
 4. When you see `SYNC COMPLETE`, you're done.
 
@@ -92,16 +92,17 @@ Professors upload new files throughout the semester. To grab only the new stuff:
 
 1. Open Moodle in Chrome, paste `moodle_sync.js` in the console
 2. Click **Incremental Sync**
-3. Pick your folder
+3. Pick your year folder (the directory handle is cached after the first run, so this step is usually automatic)
 4. Done — only new files are downloaded
 
 ## Next semester
 
 1. Open `moodle_sync_config.json` in any text editor
 2. Change `semesterCheck` to match the new semester (e.g. `"סמ 1"`)
-3. Change `rootPath` (e.g. `"שנה ד׳/סמסטר א׳"`)
+3. Change `rootPath` to the new semester folder name (e.g. `"סמסטר א׳"`) — you'll pick the year folder in the directory picker
 4. Replace the `courses` array with your new course IDs and folder names
-5. Run Seed Run again
+5. If using the scheduled task: update `semesterAbsolutePath` to the new semester folder on your machine
+6. Run Seed Run again
 
 ## Automated daily sync (optional, requires Claude Desktop)
 
@@ -111,8 +112,8 @@ If you use [Claude Desktop](https://claude.ai) with the Claude in Chrome extensi
 
 | File | Purpose |
 |------|---------|
-| `moodle_sync.js` | The sync engine (v2.2, with safety patches S1–S6). Paste into Chrome console. |
-| `moodle_sync_config.json` | Your personal config (courses, paths). **Not tracked in git** — create your own. |
+| `moodle_sync.js` | The sync engine (v2.3, with safety patches S1–S6 + update/removal detection). Paste into Chrome console. |
+| `moodle_sync_config.json` | Your personal config (courses, paths). **Not tracked in git** — create your own. The `semesterAbsolutePath` and `syncScriptPath` fields are only used by the scheduled task — update them to match your machine. |
 | `moodle_sync_spec.md` | Full technical spec with all rules and edge cases. Read this if you want to understand or modify the engine. |
 | `moodle-course-setup-SKILL.md` | Claude Desktop skill file for guided setup. |
 

@@ -475,7 +475,7 @@ This spec is designed to be reused each semester. Here's what to change:
 - Add or remove courses as needed. Update folder names if desired.
 
 ### 3. Update the disk structure
-- Change the root folder path if needed (e.g., `שנה ד׳/סמסטר א׳/` instead of `שנה ג׳/סמסטר ב׳/`).
+- Change `rootPath` if needed (e.g., `סמסטר א׳` instead of `סמסטר ב׳`). The user picks the year folder (e.g. `שנה ד׳`) in the directory picker; `rootPath` is relative to that.
 - The manifest, Excel log, and README files will be created fresh in the new folder.
 
 ### 4. Run the audit
@@ -703,12 +703,12 @@ The entire download pipeline is encoded in a single JavaScript file (`moodle_syn
      ```
      The local filesystem is the source of truth. The GitHub repo (`github.com/idomalach/bgu-moodle-sync`) is for open-source distribution only, not for runtime use.
 3. A sidebar appears on the right with two buttons: **Seed Run (Full)** and **Incremental Sync**.
-4. Click one. On the first run, the browser's directory picker opens — point it to the root download folder (the parent of `שנה ג׳`). The handle is cached in IndexedDB (S3 patch), so subsequent runs skip the picker automatically.
+4. Click one. On the first run, the browser's directory picker opens — point it to the **year folder** (e.g. `שנה ג׳`). The engine navigates into the semester subfolder (e.g. `סמסטר ב׳`) automatically via `rootPath`. The handle is cached in IndexedDB (S3 patch), so subsequent runs skip the picker.
 5. The engine scrapes all 5 courses, resolves URLs, expands folders, downloads files, saves the manifest, generates READMEs, and produces the Excel log. All automatically.
 
 ### Architecture (8-step pipeline)
 
-1. **Folder access** — `showDirectoryPicker()` → navigate to `שנה ג׳/סמסטר ב׳`.
+1. **Folder access** — `showDirectoryPicker()` → user picks the year folder (e.g. `שנה ג׳`), engine navigates into `סמסטר ב׳` via `rootPath`.
 2. **Load manifest** — read `.moodle_manifest.json` from the semester folder (empty object on first run).
 3. **Scrape courses** — for each course: fetch `course/view.php?id=X`, extract sections and items via DOM selectors, build section-to-folder mapping (stem merging, solution merging, syllabus exception).
 4. **Resolve & expand** — for each item:
@@ -810,3 +810,7 @@ Before any sync operation, the engine checks for login buttons (`התחברות`
 ### S6 — Config backup in IndexedDB
 
 The config object is saved to IndexedDB (key `config`) whenever it's loaded from `window.__MOODLE_SYNC_CONFIG__` or saved from the setup form. If config loading fails on a subsequent run (e.g., the injection didn't happen, the config file is unreachable), the engine falls back to the IndexedDB copy. This prevents the setup form from appearing unexpectedly during scheduled runs.
+
+### S7 — Stale rootPath warning
+
+When config is restored from IndexedDB (S6 fallback), the engine checks if `rootPath` contains multiple path segments (e.g. `שנה ג׳/סמסטר ב׳`). This was the old format from when the user picked the Documents folder as root. Since Chrome blocks picking system folders like Documents, the current convention is: **pick the year folder** (e.g. `שנה ג׳`) and set `rootPath` to just the semester name (e.g. `סמסטר ב׳`). A multi-segment rootPath combined with picking the year folder creates duplicate nested directories and an empty manifest (clean re-download). The engine logs a warning if this is detected.

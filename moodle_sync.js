@@ -1,5 +1,5 @@
 /**
- * BGU Moodle Sync Engine v2.2 (safety patches S1–S6)
+ * BGU Moodle Sync Engine v2.3 (safety patches S1–S6, update/removal detection)
  *
  * Unified engine for both seed runs and incremental syncs.
  * Inject this into any Moodle tab, click the button, and it handles everything.
@@ -27,7 +27,7 @@
   let CONFIG = {
     baseUrl: 'https://moodle.bgu.ac.il',
     semesterCheck: '',      // e.g. 'סמ 2' — set via config
-    rootPath: '',           // e.g. 'שנה ג׳/סמסטר ב׳' — set via config
+    rootPath: '',           // e.g. 'סמסטר ב׳' — set via config (relative to the folder picked in the directory picker)
     courses: [],            // populated from config or setup form
     silentSkipTypes: ['label', 'page', 'zoom', 'lti', 'forum', 'choicegroup'],
     assignTypes: ['assign'],
@@ -60,6 +60,13 @@
       if (cachedConfig && cachedConfig.courses && cachedConfig.courses.length > 0) {
         Object.assign(CONFIG, cachedConfig);
         log('Config restored from IndexedDB backup');
+        // S7 — Warn if cached rootPath uses the old two-part format
+        const segments = CONFIG.rootPath ? CONFIG.rootPath.split('/').filter(p => p.length > 0).length : 0;
+        if (segments > 1) {
+          log('  ⚠️ WARNING: rootPath has multiple segments ("' + CONFIG.rootPath + '") — this may create duplicate folders.');
+          log('  ⚠️ If you pick the year folder (e.g. שנה ג׳), rootPath should be just the semester (e.g. סמסטר ב׳).');
+          log('  ⚠️ Re-run with injected config or use the setup form to fix the IndexedDB cache.');
+        }
         return true;
       }
     } catch {}
@@ -74,7 +81,7 @@
   let state = {
     mode: null,           // 'seed' or 'incremental'
     rootHandle: null,     // FileSystem root directory handle
-    semesterHandle: null, // שנה ג׳/סמסטר ב׳ handle
+    semesterHandle: null, // semester folder handle (e.g. סמסטר ב׳ inside the picked year folder)
     manifest: null,       // loaded manifest JSON
     sectionMap: {},       // courseId -> sectionMapping
     items: [],            // all scraped items across courses
@@ -577,6 +584,7 @@
       const blob = await resp.blob();
       const ext = detectExtension(resp, item.name);
       const contentLength = blob.size;
+      const etag = resp.headers.get('etag') || '';
 
       // Build filename
       let fileName = normalizeName(item.name);
@@ -604,6 +612,7 @@
           success: true,
           savedAs: savedFiles.map(f => item.diskFolder ? `${item.diskFolder}/${f}` : f),
           fileSize: contentLength,
+          etag,
           extracted: true,
           extractedCount: savedFiles.length,
         };
@@ -616,6 +625,7 @@
         success: true,
         savedAs: item.diskFolder ? `${item.diskFolder}/${finalName}` : finalName,
         fileSize: contentLength,
+        etag,
         extracted: false,
       };
     } catch (e) {
@@ -900,9 +910,14 @@
       }
 
       state.rootHandle = dirHandle;
-      const yearHandle = await state.rootHandle.getDirectoryHandle('שנה ג׳', { create: true });
-      state.semesterHandle = await yearHandle.getDirectoryHandle('סמסטר ב׳', { create: true });
-      log('  Folder access granted');
+      // Walk CONFIG.rootPath dynamically (e.g. "סמסטר ב׳" → one nested dir inside the picked year folder)
+      let semHandle = state.rootHandle;
+      const pathParts = CONFIG.rootPath.split('/').filter(p => p.length > 0);
+      for (const part of pathParts) {
+        semHandle = await semHandle.getDirectoryHandle(part, { create: true });
+      }
+      state.semesterHandle = semHandle;
+      log(`  Folder access granted (root path: ${CONFIG.rootPath})`);
 
       // Step 1b: Save config to semester folder if entered via form
       if (window.__MOODLE_SYNC_CONFIG_PENDING__) {
@@ -935,6 +950,28 @@
           log('');
           log('  To fix: Run a SEED sync first, or check that the manifest file');
           log('  (.moodle_manifest.json) exists and is readable.');
+          state.running = false;
+          return;
+        }
+      }
+
+      // S7 — Abort seed into populated folder
+      if (mode === 'seed') {
+        const totalManifestItems = Object.values(state.manifest)
+          .reduce((sum, c) => sum + (c.items ? Object.keys(c.items).length : 0), 0);
+        if (totalManifestItems > 0) {
+          log('');
+          log('🛑 SAFETY ABORT: Seed run into an already-populated folder.');
+          log(`  The manifest has ${totalManifestItems} items across ${courseCount} courses.`);
+          log('  Running a seed here would create duplicate files.');
+          log('');
+          log('  For a new semester: update rootPath in the config to point to');
+          log('  a new semester folder (e.g. "סמסטר א׳"), then try again.');
+          log('  The directory picker will let you select the year folder and');
+          log('  the engine creates the new semester subfolder automatically.');
+          log('');
+          log('  If you truly want to re-download into this folder, delete');
+          log('  .moodle_manifest.json first and clear the course folders manually.');
           state.running = false;
           return;
         }
@@ -1031,7 +1068,7 @@
           } else if (resolved.type === 'dropbox') {
             downloadQueue.push({ ...item, fetchUrl: resolved.url, direct: true });
           } else if (resolved.type === 'video') {
-            // Silent skip — videos are not downloaded
+            // Intentionally silent — videos are not downloaded and not logged to Excel
           } else if (resolved.type === 'bgu_admin') {
             skipQueue.push({ ...item, reason: resolved.reason, url: resolved.url });
           } else {
@@ -1042,10 +1079,10 @@
         } else if (item.type === 'assign') {
           const files = await checkAssignPatternB(item);
           if (files.length > 0) {
-            const isProject = /פרו[יי]קט|project/i.test(item.section);
-            const targetFolder = isProject ? 'פרוייקט' : 'תרגילי בית';
+            // Use the section's mapped folder (e.g. "תרגילי בית", "הגשות", "פרוייקט" — whatever Moodle calls it)
+            const baseFolder = item.diskFolder || item.section;
             for (const file of files) {
-              const diskFolder = isSolutionFile(file.name) ? `${targetFolder}/פתרונות` : targetFolder;
+              const diskFolder = isSolutionFile(file.name) ? `${baseFolder}/פתרונות` : baseFolder;
               downloadQueue.push({
                 ...item,
                 name: file.name,
@@ -1068,22 +1105,54 @@
       log(`  Download queue: ${downloadQueue.length} files`);
       log(`  Skip queue: ${skipQueue.length} items`);
 
+      // Snapshot all resolved keys (including folder/assign children) BEFORE
+      // the incremental filter removes unchanged items.  Used later for
+      // removal detection so that existing children are not misidentified
+      // as "removed from Moodle".
+      const allResolvedKeys = new Set();
+      for (const item of allItems) allResolvedKeys.add(manifestKey(item));
+      for (const item of downloadQueue) allResolvedKeys.add(manifestKey(item));
+
       // Step 5: Filter for incremental mode
       if (mode === 'incremental') {
-        log('Step 5/8: Filtering — incremental mode...');
+        log('Step 5/8: Filtering — incremental mode (with update detection)...');
         const filtered = [];
+        let updatedCount = 0;
         for (const item of downloadQueue) {
           const courseManifest = state.manifest[item.courseId];
           const key = manifestKey(item);
           if (courseManifest && courseManifest.items && courseManifest.items[key]) {
             const existing = courseManifest.items[key];
-            // Skip items already downloaded — unless we add ETag/size comparison later
-            continue;
+            // Update detection: HEAD request to compare ETag / Content-Length
+            try {
+              const fetchUrl = item.fetchUrl || (item.direct
+                ? item.url
+                : `${CONFIG.baseUrl}/moodle/mod/resource/view.php?id=${item.cmid}`);
+              const fetchOpts = { method: 'HEAD', redirect: 'follow' };
+              if (!item.googleExport) fetchOpts.credentials = 'include';
+              const headResp = await fetch(fetchUrl, fetchOpts);
+              if (headResp.ok) {
+                const newSize = parseInt(headResp.headers.get('content-length') || '0');
+                const newEtag = headResp.headers.get('etag') || '';
+                const sizeChanged = newSize > 0 && existing.fileSize && newSize !== existing.fileSize;
+                const etagChanged = newEtag && existing.etag && newEtag !== existing.etag;
+                if (sizeChanged || etagChanged) {
+                  log(`  UPDATE detected: ${item.name} (size: ${existing.fileSize}→${newSize})`);
+                  item._deleteOldFile = existing.savedAs; // mark old file for deletion
+                  item._isUpdate = true;
+                  filtered.push(item);
+                  updatedCount++;
+                  continue;
+                }
+              }
+            } catch { /* HEAD failed — skip update check, keep existing */ }
+            continue; // no change detected — skip
           }
           filtered.push(item);
         }
+        const newCount = filtered.length - updatedCount;
         const skippedCount = downloadQueue.length - filtered.length;
-        log(`  ${filtered.length} new items to download (${skippedCount} already in manifest)`);
+        log(`  ${newCount} new, ${updatedCount} updated, ${skippedCount} unchanged`);
         downloadQueue.length = 0;
         downloadQueue.push(...filtered);
 
@@ -1100,6 +1169,25 @@
           state.running = false;
           return;
         }
+        // Removal detection: flag manifest items no longer on Moodle
+        // Uses allResolvedKeys (built BEFORE filtering) so unchanged
+        // folder/assign children are not incorrectly flagged as removed.
+        let removedCount = 0;
+        for (const [courseId, courseData] of Object.entries(state.manifest)) {
+          if (!courseData.items) continue;
+          for (const [key, entry] of Object.entries(courseData.items)) {
+            if (entry.status === 'removed_from_moodle') continue; // already flagged
+            if (!allResolvedKeys.has(key)) {
+              entry.status = 'removed_from_moodle';
+              entry.removedAt = new Date().toISOString();
+              removedCount++;
+            }
+          }
+        }
+        if (removedCount > 0) {
+          log(`  ${removedCount} items removed from Moodle (files kept on disk, flagged in manifest)`);
+        }
+
       } else {
         log('Step 5/8: Seed mode — downloading all items');
       }
@@ -1119,6 +1207,25 @@
         }
 
         const courseHandle = await getNestedDir(state.semesterHandle, item.courseName);
+
+        // If this is an update, delete the old file on disk first
+        if (item._isUpdate && item._deleteOldFile) {
+          try {
+            const oldPaths = Array.isArray(item._deleteOldFile) ? item._deleteOldFile : [item._deleteOldFile];
+            for (const oldPath of oldPaths) {
+              if (!oldPath) continue;
+              const lastSlash = oldPath.lastIndexOf('/');
+              const oldDir = lastSlash > 0 ? oldPath.substring(0, lastSlash) : '';
+              const oldName = lastSlash > 0 ? oldPath.substring(lastSlash + 1) : oldPath;
+              const dirHandle = await getNestedDir(courseHandle, oldDir);
+              await dirHandle.removeEntry(oldName);
+              log(`  Deleted old version: ${oldPath}`);
+            }
+          } catch (e) {
+            log(`  Could not delete old file: ${e.message} (will overwrite)`);
+          }
+        }
+
         const result = await downloadAndSave(item, courseHandle);
         const key = manifestKey(item);
 
@@ -1143,6 +1250,7 @@
             status,
             savedAs: result.savedAs,
             fileSize: result.fileSize,
+            etag: result.etag || '',
             downloadedAt: new Date().toISOString(),
           };
           if (result.extracted) {
@@ -1237,7 +1345,7 @@
     container.innerHTML = `
       <div style="padding:16px 18px;background:linear-gradient(135deg,#1565C0,#1976D2);color:white;">
         <h2 style="margin:0;font-size:18px;font-weight:700;">BGU Moodle Sync</h2>
-        <p style="margin:4px 0 0;opacity:0.8;font-size:11px;">v2.2 — One-click course material sync (safety patches S1–S6)</p>
+        <p style="margin:4px 0 0;opacity:0.8;font-size:11px;">v2.3 — One-click course material sync (S1–S6 + update/removal detection)</p>
       </div>
       <div style="padding:14px 18px;display:flex;gap:10px;">
         <button id="sync-seed" style="flex:1;padding:12px 8px;background:#2E7D32;color:white;border:none;border-radius:8px;font-size:13px;cursor:pointer;font-weight:600;transition:opacity .15s;">
@@ -1300,12 +1408,13 @@
         <p style="margin:0 0 12px;font-size:12px;color:#666;">
           No config found. Enter your semester details and courses below.
           This creates a <code>moodle_sync_config.json</code> in your semester folder.
+          When the folder picker opens, select your <b>year folder</b> (e.g. שנה ג׳).
         </p>
         <label style="font-size:12px;font-weight:600;">Semester identifier (appears in course titles):</label>
         <input id="cfg-semester" placeholder="e.g. סמ 2" value="" style="width:100%;padding:6px;margin:4px 0 10px;border:1px solid #ccc;border-radius:4px;font-size:13px;">
 
-        <label style="font-size:12px;font-weight:600;">Root folder path (inside your download folder):</label>
-        <input id="cfg-rootpath" placeholder="e.g. שנה ג׳/סמסטר ב׳" value="" style="width:100%;padding:6px;margin:4px 0 10px;border:1px solid #ccc;border-radius:4px;font-size:13px;">
+        <label style="font-size:12px;font-weight:600;">Semester folder name (inside the year folder you'll pick):</label>
+        <input id="cfg-rootpath" placeholder="e.g. סמסטר ב׳" value="" style="width:100%;padding:6px;margin:4px 0 10px;border:1px solid #ccc;border-radius:4px;font-size:13px;">
 
         <label style="font-size:12px;font-weight:600;">Courses (one per line: <code>ID | Folder Name</code>):</label>
         <textarea id="cfg-courses" rows="6" placeholder="64674 | הנדסת חשמל&#10;65670 | מימון" style="width:100%;padding:6px;margin:4px 0 10px;border:1px solid #ccc;border-radius:4px;font-size:12px;font-family:monospace;"></textarea>
@@ -1385,7 +1494,7 @@
     const configLoaded = await loadConfig();
 
     if (configLoaded && CONFIG.courses.length > 0) {
-      log(`Sync engine v2.2 loaded. ${CONFIG.courses.length} courses configured.`);
+      log(`Sync engine v2.3 loaded. ${CONFIG.courses.length} courses configured.`);
       log('Choose a mode to begin.');
     } else {
       log('No config found — showing setup form...');

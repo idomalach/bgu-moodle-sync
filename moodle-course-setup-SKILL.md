@@ -14,7 +14,7 @@ The sync system has three files:
 | File | What it does |
 |------|-------------|
 | `moodle_sync_config.json` | Course list, semester ID, folder paths. **Edit this** to change courses. |
-| `moodle_sync.js` | The sync engine (v2.2). Runs in a Moodle browser tab. Course-agnostic — reads config at runtime. Includes safety patches S1–S6. |
+| `moodle_sync.js` | The sync engine (v2.3). Runs in a Moodle browser tab. Course-agnostic — reads config at runtime. Includes safety patches S1–S6. |
 | `moodle_sync_spec.md` | Full specification with all rules, edge cases, safety rules, and implementation notes. Reference doc. |
 
 All three live in the user's working folder (e.g. "Moodle content download" in Documents/Claude/Projects).
@@ -37,7 +37,7 @@ All three live in the user's working folder (e.g. "Moodle content download" in D
 Ask the user (use AskUserQuestion tool):
 
 1. **Semester identifier** — the string that appears in Moodle course titles (e.g. "סמ 2" for semester B, "סמ 1" for semester A)
-2. **Year and level** — for the folder path (e.g. "שנה ג׳/סמסטר ב׳")
+2. **Year and semester** — the year folder the user will pick in the directory picker (e.g. "שנה ג׳") and the semester subfolder name for `rootPath` (e.g. "סמסטר ב׳")
 3. **Courses** — for each course:
    - The Moodle course ID (from the URL: `course/view.php?id=XXXXX`)
    - The short folder name they want (e.g. "רגרסיה" instead of the full Moodle title)
@@ -53,7 +53,7 @@ Write `moodle_sync_config.json` with the gathered inputs:
 {
   "baseUrl": "https://moodle.bgu.ac.il",
   "semesterCheck": "<semester identifier>",
-  "rootPath": "<year>/<semester>",
+  "rootPath": "<semester>",
   "semesterAbsolutePath": "<absolute path to semester folder>",
   "syncScriptPath": "<absolute path to moodle_sync.js>",
   "courses": [
@@ -86,7 +86,7 @@ If any course fails, help the user find the correct ID via Moodle search.
    ```
 3. Read `moodle_sync.js` from the local filesystem and inject it into the Moodle tab.
 4. The sidebar appears. Tell the user to click **"Seed Run (Full)"**.
-5. The directory picker opens — user selects the root download folder. After this first selection, the handle is cached in IndexedDB (S3 patch) so future runs skip the picker.
+5. The directory picker opens — user selects the **year folder** (e.g. `שנה ג׳`). The engine navigates into the semester subfolder via `rootPath`. After this first selection, the handle is cached in IndexedDB (S3 patch) so future runs skip the picker.
 6. Monitor the log for "SYNC COMPLETE".
 7. Report results: files downloaded, items skipped, any errors.
 
@@ -150,4 +150,4 @@ Checklist:
 - Full spec: `moodle_sync_spec.md` in the working folder
 - Engine source: `moodle_sync.js` in the working folder
 - Config: `moodle_sync_config.json` in the working folder (and semester folder after first run)
-- GitHub repo: `github.com/idomalach/bgu-moodle-sync` (for open-source sharing, not for runtime use)
+- GitHub repo: [`github.com/idomalach/bgu-moodle-sync`](https://github.com/idomalach/bgu-moodle-sync) (for open-source sharing, not for runtime use)
