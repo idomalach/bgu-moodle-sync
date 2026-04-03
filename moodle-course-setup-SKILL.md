@@ -14,7 +14,7 @@ The sync system has three files:
 | File | What it does |
 |------|-------------|
 | `moodle_sync_config.json` | Course list, semester ID, folder paths. **Edit this** to change courses. |
-| `moodle_sync.js` | The sync engine (v2.3). Runs in a Moodle browser tab. Course-agnostic — reads config at runtime. Includes safety patches S1–S6. |
+| `moodle_sync.js` | The sync engine (v2.6). Runs in a Moodle browser tab. Course-agnostic — reads config at runtime. Includes safety patches S1–S11. |
 | `moodle_sync_spec.md` | Full specification with all rules, edge cases, safety rules, and implementation notes. Reference doc. |
 
 All three live in the user's working folder (e.g. "Moodle content download" in Documents/Claude/Projects).
@@ -80,11 +80,25 @@ If any course fails, help the user find the correct ID via Moodle search.
 ### Step 4 — Run the seed sync
 
 1. Read the config file from disk at its `syncScriptPath` location.
-2. Inject the config into the Moodle tab:
+2. Inject the config into the Moodle tab via `javascript_tool`:
    ```javascript
    window.__MOODLE_SYNC_CONFIG__ = <config JSON>;
    ```
-3. Read `moodle_sync.js` from the local filesystem and inject it into the Moodle tab.
+3. Inject the engine via localhost fetch (the engine is ~60KB — too large to paste into `javascript_tool` directly):
+   ```bash
+   # Start a temporary HTTP server
+   cd "<directory containing moodle_sync.js>" && python3 -m http.server 18765 &
+   # Note the PID
+   ```
+   ```javascript
+   // In javascript_tool — one call, no chunking
+   fetch('http://localhost:18765/moodle_sync.js')
+     .then(r => r.text()).then(code => eval(code))
+     .then(() => 'Engine loaded').catch(e => 'FAILED: ' + e.message)
+   ```
+   ```bash
+   kill <PID>  # Stop the server
+   ```
 4. The sidebar appears. Tell the user to click **"Seed Run (Full)"**.
 5. The directory picker opens — user selects the **year folder** (e.g. `שנה ג׳`). The engine navigates into the semester subfolder via `rootPath`. After this first selection, the handle is cached in IndexedDB (S3 patch) so future runs skip the picker.
 6. Monitor the log for "SYNC COMPLETE".
@@ -106,11 +120,10 @@ Walk the user through any manual steps.
 Create (or update) the `moodle-incremental-sync` scheduled task:
 - Runs daily at 4 PM (16:00)
 - Reads config from the absolute path to `moodle_sync_config.json`
-- Reads the engine from the local `moodle_sync.js` file (NOT from GitHub)
-- Injects config + engine into a Moodle tab via `javascript_tool`
+- Injects config via `javascript_tool`, then serves the engine via a temporary localhost HTTP server (`python3 -m http.server 18765`) and fetches it from the browser — this avoids the 60KB engine exceeding `javascript_tool`'s practical input limit
 - Triggers incremental sync
 
-**Important:** The task must read the engine from the local filesystem. Do NOT fetch from GitHub — the local file is the source of truth.
+**Important:** The task must serve the engine from the local filesystem. Do NOT fetch from GitHub — the local file is the source of truth. The localhost fetch approach means the model never needs to read and paste the engine — the browser loads it directly.
 
 Update the task prompt with the correct absolute paths from the config.
 

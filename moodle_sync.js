@@ -1,5 +1,5 @@
 /**
- * BGU Moodle Sync Engine v2.3 (safety patches S1–S6, update/removal detection)
+ * BGU Moodle Sync Engine v2.6 (safety patches S1–S11, update/removal detection, incremental Excel merge, download retry, progress bar, desktop notifications)
  *
  * Unified engine for both seed runs and incremental syncs.
  * Inject this into any Moodle tab, click the button, and it handles everything.
@@ -30,7 +30,6 @@
     rootPath: '',           // e.g. 'סמסטר ב׳' — set via config (relative to the folder picked in the directory picker)
     courses: [],            // populated from config or setup form
     silentSkipTypes: ['label', 'page', 'zoom', 'lti', 'forum', 'choicegroup'],
-    assignTypes: ['assign'],
     mergeThreshold: 3,
     delayBetweenFetches: 200,
     batchPause: 500,
@@ -401,7 +400,12 @@
         return { type: 'google_drive', url: targetUrl, reason: 'Google Drive folder — explore manually' };
       }
       if (hostname.includes('dropbox.com')) {
-        return { type: 'dropbox', url: targetUrl.replace(/\?dl=0/, '?dl=1').replace(/&dl=0/, '&dl=1') };
+        let dbUrl = targetUrl.replace(/\?dl=0/, '?dl=1').replace(/&dl=0/, '&dl=1');
+        // If no dl param was present at all, append it
+        if (!dbUrl.includes('dl=1')) {
+          dbUrl += (dbUrl.includes('?') ? '&' : '?') + 'dl=1';
+        }
+        return { type: 'dropbox', url: dbUrl };
       }
       if (hostname.includes('sites.google.com')) {
         return { type: 'google_sites', url: targetUrl, reason: 'Google Sites — explore for linked files' };
@@ -410,8 +414,8 @@
           hostname.includes('zoom.us') || hostname.includes('vimeo.com')) {
         return { type: 'video', url: targetUrl, reason: 'video' };
       }
-      if (hostname.includes('bgu4u.bgu.ac.il')) {
-        return { type: 'bgu_admin', url: targetUrl, reason: 'BGU admin page — requires link-hopping' };
+      if (hostname.includes('bgu4u.bgu.ac.il') || hostname.includes('in.bgu.ac.il') || hostname.includes('iguide.bgu.ac.il')) {
+        return { type: 'bgu_internal', url: targetUrl };
       }
       if (hostname.includes('github.com')) {
         return { type: 'external', url: targetUrl, reason: 'GitHub link' };
@@ -452,6 +456,77 @@
       return files;
     } catch (e) {
       return [];
+    }
+  }
+
+  // ============================================================
+  // BGU INTERNAL LINK PROBING
+  // ============================================================
+
+  /**
+   * Attempt to fetch a BGU internal page (bgu4u, iguide, in.bgu, etc.)
+   * and find a downloadable file linked from it (PDF, document, etc.).
+   * These pages often host syllabuses or course documents behind an extra
+   * click — but if opened in the same browser profile they're reachable.
+   *
+   * Returns { found: true, url, name } if a downloadable link is found,
+   * or { found: false, reason } if the page is truly admin-only or empty.
+   */
+  async function probeBguInternalLink(targetUrl) {
+    try {
+      const resp = await fetch(targetUrl, { credentials: 'include', redirect: 'follow' });
+      if (!resp.ok) {
+        return { found: false, reason: 'BGU internal page — HTTP ' + resp.status };
+      }
+      const contentType = resp.headers.get('content-type') || '';
+
+      // Case 1: The URL itself redirected straight to a file (PDF, etc.)
+      if (contentType.includes('application/pdf') || contentType.includes('application/octet-stream') ||
+          contentType.includes('application/zip') || contentType.includes('application/vnd.')) {
+        // It's a direct file download — return the final URL
+        const blob = await resp.blob();
+        return { found: true, directBlob: blob, contentType, finalUrl: resp.url };
+      }
+
+      // Case 2: It's an HTML page — parse it and look for file links
+      const html = await resp.text();
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+
+      // Look for common patterns: direct PDF links, pluginfile links, embedded objects
+      const candidates = [];
+
+      // Links with file extensions
+      const allLinks = doc.querySelectorAll('a[href]');
+      for (const a of allLinks) {
+        const href = a.href;
+        if (!href) continue;
+        // Match common downloadable file extensions
+        if (/\.(pdf|docx?|pptx?|xlsx?|zip|rar)(\?|$)/i.test(href)) {
+          candidates.push({ url: href, name: a.textContent.trim() || 'document' });
+        }
+        // Match pluginfile.php links (Moodle-style)
+        if (href.includes('pluginfile.php')) {
+          candidates.push({ url: href, name: a.textContent.trim() || 'document' });
+        }
+      }
+
+      // Embedded PDF viewers (<embed>, <iframe>, <object>)
+      const embeds = doc.querySelectorAll('embed[src], iframe[src], object[data]');
+      for (const el of embeds) {
+        const src = el.src || el.getAttribute('data') || '';
+        if (src && /\.(pdf)(\?|$)/i.test(src)) {
+          candidates.push({ url: src, name: 'embedded_document' });
+        }
+      }
+
+      if (candidates.length > 0) {
+        // Return the first (most likely) candidate
+        return { found: true, url: candidates[0].url, name: candidates[0].name };
+      }
+
+      return { found: false, reason: 'BGU internal page — no downloadable files found' };
+    } catch (e) {
+      return { found: false, reason: 'BGU internal page — fetch error: ' + e.message };
     }
   }
 
@@ -562,8 +637,17 @@
     return finalName;
   }
 
-  /** Download a file and save it to the correct location */
-  async function downloadAndSave(item, courseHandle) {
+  /** Download a file and save it to the correct location (with retry) */
+  async function downloadAndSave(item, courseHandle, maxRetries = 3) {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      const result = await _downloadAndSaveOnce(item, courseHandle);
+      if (result.success || attempt === maxRetries) return result;
+      log(`  ⟳ Retry ${attempt}/${maxRetries - 1} for ${item.name} (${result.error})`);
+      await delay(1000 * attempt); // 1s, 2s, 3s backoff
+    }
+  }
+
+  async function _downloadAndSaveOnce(item, courseHandle) {
     const fetchUrl = item.fetchUrl || (item.direct
       ? item.url
       : `${CONFIG.baseUrl}/moodle/mod/resource/view.php?id=${item.cmid}`);
@@ -683,22 +767,86 @@
   }
 
   // ============================================================
-  // MANIFEST MANAGEMENT (patched: S1, S2)
+  // S11 — FILESYSTEM HEALTH CHECK
+  // ============================================================
+
+  async function isFilesystemHealthy(dirHandle) {
+    // Try a canary write/delete to verify the FUSE mount is responsive.
+    // If this times out or fails, the mount is deadlocked.
+    const CANARY = '.moodle_sync_canary';
+    const TIMEOUT_MS = 5000;
+    try {
+      const result = await Promise.race([
+        (async () => {
+          const fh = await dirHandle.getFileHandle(CANARY, { create: true });
+          const w = await fh.createWritable();
+          await w.write('ok');
+          await w.close();
+          await dirHandle.removeEntry(CANARY);
+          return true;
+        })(),
+        new Promise(resolve => setTimeout(() => resolve(false), TIMEOUT_MS)),
+      ]);
+      if (!result) log('  ⚠️ Filesystem health check timed out (FUSE mount may be deadlocked)');
+      return result;
+    } catch (e) {
+      log(`  ⚠️ Filesystem health check failed: ${e.message}`);
+      return false;
+    }
+  }
+
+  // ============================================================
+  // S9 — PERSISTENT SYNC LOCK
+  // ============================================================
+
+  const STALE_LOCK_THRESHOLD_MS = 10 * 60 * 1000; // 10 minutes
+
+  async function acquireSyncLock(mode) {
+    const existing = await idbGet('syncLock');
+    if (existing && existing.running) {
+      const age = Date.now() - new Date(existing.startedAt).getTime();
+      if (age < STALE_LOCK_THRESHOLD_MS) {
+        // Recent lock — another tab may be running
+        log(`  ⚠️ Sync lock held since ${existing.startedAt} (${Math.round(age / 1000)}s ago) — refusing to start.`);
+        log('  If no other sync is running, wait a few minutes or reload the page.');
+        return false;
+      }
+      // Stale lock — previous run was interrupted
+      log(`  ⚠️ Found stale sync lock from ${existing.startedAt} (${Math.round(age / 60000)} min ago).`);
+      log('  Previous sync was likely interrupted. Clearing lock and proceeding.');
+    }
+    await idbSet('syncLock', { running: true, startedAt: new Date().toISOString(), mode });
+    return true;
+  }
+
+  async function releaseSyncLock() {
+    await idbSet('syncLock', { running: false, clearedAt: new Date().toISOString() });
+  }
+
+  // ============================================================
+  // MANIFEST MANAGEMENT (patched: S1, S2, S10, S11)
   // ============================================================
 
   async function loadManifest(semesterHandle) {
-    // Try filesystem first
-    try {
-      const fh = await semesterHandle.getFileHandle('.moodle_manifest.json');
-      const file = await fh.getFile();
-      const text = await file.text();
-      const manifest = JSON.parse(text);
-      if (manifest && Object.keys(manifest).length > 0) {
-        log('  Manifest loaded from filesystem');
-        return manifest;
+    // S11 — Check filesystem health before attempting read
+    const fsHealthy = await isFilesystemHealthy(semesterHandle);
+
+    if (fsHealthy) {
+      // Try filesystem first
+      try {
+        const fh = await semesterHandle.getFileHandle('.moodle_manifest.json');
+        const file = await fh.getFile();
+        const text = await file.text();
+        const manifest = JSON.parse(text);
+        if (manifest && Object.keys(manifest).length > 0) {
+          log('  Manifest loaded from filesystem');
+          return manifest;
+        }
+      } catch {
+        // filesystem failed — fall through to IndexedDB
       }
-    } catch {
-      // filesystem failed — fall through to IndexedDB
+    } else {
+      log('  Skipping filesystem manifest read (health check failed) — going straight to IndexedDB');
     }
 
     // S2 — Fallback: try IndexedDB backup
@@ -714,15 +862,20 @@
   }
 
   async function saveManifest(semesterHandle, manifest) {
-    // Save to filesystem
-    const fh = await semesterHandle.getFileHandle('.moodle_manifest.json', { create: true });
-    const writable = await fh.createWritable();
-    await writable.write(JSON.stringify(manifest, null, 2));
-    await writable.close();
-
-    // S2 — Also save to IndexedDB as backup
+    // S10 — Save to IndexedDB FIRST (atomic, survives interruption)
     await idbSet('manifest', manifest);
-    log('  Manifest saved to filesystem + IndexedDB backup');
+    log('  Manifest saved to IndexedDB backup');
+
+    // Then save to filesystem (may be interrupted by tab close / FUSE issues)
+    try {
+      const fh = await semesterHandle.getFileHandle('.moodle_manifest.json', { create: true });
+      const writable = await fh.createWritable();
+      await writable.write(JSON.stringify(manifest, null, 2));
+      await writable.close();
+      log('  Manifest saved to filesystem');
+    } catch (e) {
+      log(`  ⚠️ Filesystem manifest save failed: ${e.message} — IndexedDB backup is intact`);
+    }
   }
 
   // ============================================================
@@ -730,24 +883,52 @@
   // ============================================================
 
   async function generateExcel(semesterHandle, skipQueue) {
-    if (skipQueue.length === 0) {
-      log('No skipped items — skipping Excel generation');
-      return;
-    }
-
     try {
       const XLSX = await ensureSheetJS();
 
-      const rows = skipQueue.map(item => ({
+      // Read existing Excel to preserve previous entries (incremental merge)
+      let existingRows = [];
+      try {
+        const fh = await semesterHandle.getFileHandle('קבצים שלא הורדו.xlsx');
+        const file = await fh.getFile();
+        const buf = await file.arrayBuffer();
+        const wb = XLSX.read(buf, { type: 'array' });
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        if (ws) {
+          existingRows = XLSX.utils.sheet_to_json(ws);
+        }
+        log(`  Read ${existingRows.length} existing entries from Excel`);
+      } catch {
+        // No existing file — start fresh
+      }
+
+      const newRows = skipQueue.map(item => ({
         'קורס': item.courseName || '',
         'מיקום במוודל': item.section || '',
         'שם': item.name || '',
         'סוג': item.type || '',
         'סיבה': item.reason || '',
         'קישור': item.url || '',
+        'תאריך': new Date().toISOString().split('T')[0],
       }));
 
-      const ws = XLSX.utils.json_to_sheet(rows);
+      // Dedup: use קישור+שם as unique key to avoid duplicate entries
+      const seen = new Set();
+      const merged = [];
+      for (const row of [...newRows, ...existingRows]) {
+        const key = `${row['קישור'] || ''}||${row['שם'] || ''}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          merged.push(row);
+        }
+      }
+
+      if (merged.length === 0) {
+        log('No skipped items — skipping Excel generation');
+        return;
+      }
+
+      const ws = XLSX.utils.json_to_sheet(merged);
 
       // Set column widths
       ws['!cols'] = [
@@ -757,6 +938,7 @@
         { wch: 12 }, // סוג
         { wch: 30 }, // סיבה
         { wch: 50 }, // קישור
+        { wch: 12 }, // תאריך
       ];
 
       const wb = XLSX.utils.book_new();
@@ -770,7 +952,8 @@
       await writable.write(blob);
       await writable.close();
 
-      log(`Excel generated: ${skipQueue.length} items in קבצים שלא הורדו.xlsx`);
+      const newEntries = merged.length - existingRows.length;
+      log(`Excel updated: ${merged.length} total items (${newEntries >= 0 ? newEntries : 0} new from this run) in קבצים שלא הורדו.xlsx`);
     } catch (e) {
       log(`ERROR generating Excel: ${e.message}`);
     }
@@ -833,16 +1016,29 @@
   // MAIN SYNC ORCHESTRATOR
   // ============================================================
 
-  async function runSync(mode) {
+  async function runSync(mode, options = {}) {
+    const dryRun = options.dryRun || false;
+
     if (state.running) {
       log('Sync already running — ignoring');
       return;
     }
+
+    // S9 — Acquire persistent sync lock (survives tab close) — skip for dry runs
+    if (!dryRun) {
+      const lockAcquired = await acquireSyncLock(mode);
+      if (!lockAcquired) {
+        log('Cannot start sync — another sync may be in progress.');
+        log('If this is wrong, wait 10 minutes for the stale lock to auto-clear.');
+        return;
+      }
+    }
+
     state.running = true;
     state.mode = mode;
     state.log = [];
     state.results = { downloaded: 0, failed: 0, skipped: 0, newItems: 0, updated: 0 };
-    log(`=== Starting ${mode.toUpperCase()} sync ===`);
+    log(`=== Starting ${mode.toUpperCase()}${dryRun ? ' DRY RUN' : ''} sync ===`);
     log('');
 
     try {
@@ -955,7 +1151,7 @@
         }
       }
 
-      // S7 — Abort seed into populated folder
+      // S8 — Abort seed into populated folder
       if (mode === 'seed') {
         const totalManifestItems = Object.values(state.manifest)
           .reduce((sum, c) => sum + (c.items ? Object.keys(c.items).length : 0), 0);
@@ -1069,8 +1265,24 @@
             downloadQueue.push({ ...item, fetchUrl: resolved.url, direct: true });
           } else if (resolved.type === 'video') {
             // Intentionally silent — videos are not downloaded and not logged to Excel
-          } else if (resolved.type === 'bgu_admin') {
-            skipQueue.push({ ...item, reason: resolved.reason, url: resolved.url });
+          } else if (resolved.type === 'bgu_internal') {
+            // Try to probe the BGU page for downloadable files
+            log(`  Probing BGU internal link: ${resolved.url}`);
+            const probe = await probeBguInternalLink(resolved.url);
+            if (probe.found) {
+              if (probe.directBlob) {
+                // The URL itself was a file — queue it for direct save
+                log(`  → Direct file found (${probe.contentType})`);
+                downloadQueue.push({ ...item, fetchUrl: resolved.url, direct: true });
+              } else {
+                // Found a link to a file on the page
+                log(`  → Found downloadable link: ${probe.name}`);
+                downloadQueue.push({ ...item, fetchUrl: probe.url, direct: true });
+              }
+            } else {
+              log(`  → ${probe.reason}`);
+              skipQueue.push({ ...item, reason: probe.reason, url: resolved.url });
+            }
           } else {
             skipQueue.push({ ...item, reason: resolved.reason || 'external link', url: resolved.url || '' });
           }
@@ -1115,16 +1327,58 @@
 
       // Step 5: Filter for incremental mode
       if (mode === 'incremental') {
-        log('Step 5/8: Filtering — incremental mode (with update detection)...');
+        log('Step 5/8: Filtering — incremental mode (with smart update detection)...');
         const filtered = [];
         let updatedCount = 0;
+        let headRequestCount = 0;
+
+        // Smart optimization: build a set of known keys per course from the
+        // download queue (post-expansion). If a course's scraped key set is
+        // identical to its manifest key set, skip HEAD requests entirely for
+        // that course — nothing could have changed.
+        const scrapedKeysByCourse = {};
+        for (const item of downloadQueue) {
+          const cid = item.courseId;
+          if (!scrapedKeysByCourse[cid]) scrapedKeysByCourse[cid] = new Set();
+          scrapedKeysByCourse[cid].add(manifestKey(item));
+        }
+
+        const unchangedCourses = new Set();
+        for (const [cid, scrapedKeys] of Object.entries(scrapedKeysByCourse)) {
+          const courseManifest = state.manifest[cid];
+          if (!courseManifest || !courseManifest.items) continue;
+          const manifestKeys = new Set(Object.keys(courseManifest.items).filter(
+            k => courseManifest.items[k].status !== 'removed_from_moodle'
+          ));
+          // Same keys = same items on Moodle. Skip HEAD checks for this course.
+          if (scrapedKeys.size === manifestKeys.size &&
+              [...scrapedKeys].every(k => manifestKeys.has(k))) {
+            unchangedCourses.add(cid);
+          }
+        }
+        if (unchangedCourses.size > 0) {
+          const names = CONFIG.courses
+            .filter(c => unchangedCourses.has(String(c.id)))
+            .map(c => c.folderName);
+          log(`  Skipping HEAD checks for ${unchangedCourses.size} unchanged course(s): ${names.join(', ')}`);
+        }
+
         for (const item of downloadQueue) {
           const courseManifest = state.manifest[item.courseId];
           const key = manifestKey(item);
           if (courseManifest && courseManifest.items && courseManifest.items[key]) {
             const existing = courseManifest.items[key];
+
+            // If this course has identical items to the manifest, skip the
+            // expensive HEAD request — no new/removed items means updates are
+            // extremely unlikely for typical Moodle usage.
+            if (unchangedCourses.has(String(item.courseId))) {
+              continue; // unchanged — skip without HEAD
+            }
+
             // Update detection: HEAD request to compare ETag / Content-Length
             try {
+              headRequestCount++;
               const fetchUrl = item.fetchUrl || (item.direct
                 ? item.url
                 : `${CONFIG.baseUrl}/moodle/mod/resource/view.php?id=${item.cmid}`);
@@ -1152,7 +1406,7 @@
         }
         const newCount = filtered.length - updatedCount;
         const skippedCount = downloadQueue.length - filtered.length;
-        log(`  ${newCount} new, ${updatedCount} updated, ${skippedCount} unchanged`);
+        log(`  ${newCount} new, ${updatedCount} updated, ${skippedCount} unchanged (${headRequestCount} HEAD requests sent)`);
         downloadQueue.length = 0;
         downloadQueue.push(...filtered);
 
@@ -1197,130 +1451,193 @@
       let downloaded = 0;
       let failed = 0;
 
-      for (let i = 0; i < downloadQueue.length; i++) {
-        const item = downloadQueue[i];
-        if (i > 0 && i % 10 === 0) {
-          await delay(CONFIG.batchPause);
-        }
-        if (i % 5 === 0 || i === downloadQueue.length - 1) {
-          log(`  [${i + 1}/${downloadQueue.length}] ${item.courseName}/${item.name}`);
-        }
-
-        const courseHandle = await getNestedDir(state.semesterHandle, item.courseName);
-
-        // If this is an update, delete the old file on disk first
-        if (item._isUpdate && item._deleteOldFile) {
-          try {
-            const oldPaths = Array.isArray(item._deleteOldFile) ? item._deleteOldFile : [item._deleteOldFile];
-            for (const oldPath of oldPaths) {
-              if (!oldPath) continue;
-              const lastSlash = oldPath.lastIndexOf('/');
-              const oldDir = lastSlash > 0 ? oldPath.substring(0, lastSlash) : '';
-              const oldName = lastSlash > 0 ? oldPath.substring(lastSlash + 1) : oldPath;
-              const dirHandle = await getNestedDir(courseHandle, oldDir);
-              await dirHandle.removeEntry(oldName);
-              log(`  Deleted old version: ${oldPath}`);
-            }
-          } catch (e) {
-            log(`  Could not delete old file: ${e.message} (will overwrite)`);
-          }
-        }
-
-        const result = await downloadAndSave(item, courseHandle);
-        const key = manifestKey(item);
-
-        // Ensure course entry in manifest
-        if (!state.manifest[item.courseId]) {
-          state.manifest[item.courseId] = {
-            courseName: item.courseName,
-            folderName: item.courseName,
-            lastSync: new Date().toISOString(),
-            sectionMap: state.sectionMap[item.courseId] || {},
-            items: {},
-          };
-        }
-
-        if (result.success) {
-          downloaded++;
-          const status = result.extracted ? 'extracted' : 'downloaded';
-          state.manifest[item.courseId].items[key] = {
-            section: item.section,
-            moodleName: item.name,
-            type: item.type,
-            status,
-            savedAs: result.savedAs,
-            fileSize: result.fileSize,
-            etag: result.etag || '',
-            downloadedAt: new Date().toISOString(),
-          };
-          if (result.extracted) {
-            log(`  ✓ Extracted ${result.extractedCount} files from ${item.name}`);
-          }
+      // === DRY RUN: skip download, manifest, and output generation ===
+      if (dryRun) {
+        log('');
+        log('╔══════════════════════════════════════╗');
+        log('║        DRY RUN COMPLETE              ║');
+        log('║  (no files downloaded or modified)    ║');
+        log('╚══════════════════════════════════════╝');
+        log('');
+        if (downloadQueue.length === 0 && skipQueue.length === 0) {
+          log('  Nothing to do — all courses are up to date.');
         } else {
-          failed++;
-          log(`  ✗ FAILED: ${item.name} — ${result.error}`);
-          skipQueue.push({ ...item, reason: `download error: ${result.error}` });
+          if (downloadQueue.length > 0) {
+            log(`  WOULD DOWNLOAD (${downloadQueue.length} files):`);
+            for (const item of downloadQueue) {
+              const tag = item._isUpdate ? '↻ update' : '+ new';
+              log(`    [${tag}] ${item.courseName}/${item.diskFolder || ''}/${normalizeName(item.name)}`);
+            }
+            log('');
+          }
+          if (skipQueue.length > 0) {
+            log(`  WOULD SKIP (${skipQueue.length} items):`);
+            for (const item of skipQueue) {
+              log(`    [skip] ${item.courseName}/${item.name} — ${item.reason}`);
+            }
+          }
+        }
+        log('');
+        log('Run an Incremental Sync to execute these actions for real.');
+
+        state.results = { downloaded: 0, failed: 0, skipped: skipQueue.length };
+        state.skipQueue = skipQueue;
+
+      } else {
+        // === REAL RUN: download, save, generate ===
+
+        // Show progress bar
+        const progressContainer = document.getElementById('sync-progress');
+        const progressBar = document.getElementById('sync-progress-bar');
+        if (progressContainer) progressContainer.style.display = 'block';
+
+        for (let i = 0; i < downloadQueue.length; i++) {
+          const item = downloadQueue[i];
+          if (i > 0 && i % 10 === 0) {
+            await delay(CONFIG.batchPause);
+          }
+          if (i % 5 === 0 || i === downloadQueue.length - 1) {
+            log(`  [${i + 1}/${downloadQueue.length}] ${item.courseName}/${item.name}`);
+          }
+          // Update progress bar
+          if (progressBar && downloadQueue.length > 0) {
+            progressBar.style.width = `${Math.round(((i + 1) / downloadQueue.length) * 100)}%`;
+          }
+
+          const courseHandle = await getNestedDir(state.semesterHandle, item.courseName);
+
+          // If this is an update, delete the old file on disk first
+          if (item._isUpdate && item._deleteOldFile) {
+            try {
+              const oldPaths = Array.isArray(item._deleteOldFile) ? item._deleteOldFile : [item._deleteOldFile];
+              for (const oldPath of oldPaths) {
+                if (!oldPath) continue;
+                const lastSlash = oldPath.lastIndexOf('/');
+                const oldDir = lastSlash > 0 ? oldPath.substring(0, lastSlash) : '';
+                const oldName = lastSlash > 0 ? oldPath.substring(lastSlash + 1) : oldPath;
+                const dirHandle = await getNestedDir(courseHandle, oldDir);
+                await dirHandle.removeEntry(oldName);
+                log(`  Deleted old version: ${oldPath}`);
+              }
+            } catch (e) {
+              log(`  Could not delete old file: ${e.message} (will overwrite)`);
+            }
+          }
+
+          const result = await downloadAndSave(item, courseHandle);
+          const key = manifestKey(item);
+
+          // Ensure course entry in manifest
+          if (!state.manifest[item.courseId]) {
+            state.manifest[item.courseId] = {
+              courseName: item.courseName,
+              folderName: item.courseName,
+              lastSync: new Date().toISOString(),
+              sectionMap: state.sectionMap[item.courseId] || {},
+              items: {},
+            };
+          }
+
+          if (result.success) {
+            downloaded++;
+            const status = result.extracted ? 'extracted' : 'downloaded';
+            state.manifest[item.courseId].items[key] = {
+              section: item.section,
+              moodleName: item.name,
+              type: item.type,
+              status,
+              savedAs: result.savedAs,
+              fileSize: result.fileSize,
+              etag: result.etag || '',
+              downloadedAt: new Date().toISOString(),
+            };
+            if (result.extracted) {
+              log(`  ✓ Extracted ${result.extractedCount} files from ${item.name}`);
+            }
+          } else {
+            failed++;
+            log(`  ✗ FAILED: ${item.name} — ${result.error}`);
+            skipQueue.push({ ...item, reason: `download error: ${result.error}` });
+          }
+
+          await delay(CONFIG.delayBetweenFetches);
         }
 
-        await delay(CONFIG.delayBetweenFetches);
-      }
+        log(`  Downloads complete: ${downloaded} ok, ${failed} failed`);
 
-      log(`  Downloads complete: ${downloaded} ok, ${failed} failed`);
-
-      // Step 7: Save manifest with section mappings
-      log('Step 7/8: Saving manifest and section mappings...');
-      for (const course of CONFIG.courses) {
-        if (state.manifest[course.id]) {
-          state.manifest[course.id].lastSync = new Date().toISOString();
-          state.manifest[course.id].sectionMap = state.sectionMap[course.id] || {};
+        // Step 7: Save manifest with section mappings
+        log('Step 7/8: Saving manifest and section mappings...');
+        for (const course of CONFIG.courses) {
+          if (state.manifest[course.id]) {
+            state.manifest[course.id].lastSync = new Date().toISOString();
+            state.manifest[course.id].sectionMap = state.sectionMap[course.id] || {};
+          }
         }
-      }
-      await saveManifest(state.semesterHandle, state.manifest);
-      log('  Manifest saved');
+        await saveManifest(state.semesterHandle, state.manifest);
+        log('  Manifest saved');
 
-      // Step 8: Generate READMEs and Excel
-      log('Step 8/8: Generating READMEs and Excel...');
-      for (const course of CONFIG.courses) {
-        if (state.manifest[course.id]) {
-          const courseHandle = await getNestedDir(state.semesterHandle, course.folderName);
-          await generateReadme(courseHandle, course.folderName, state.manifest[course.id]);
+        // Step 8: Generate READMEs and Excel
+        log('Step 8/8: Generating READMEs and Excel...');
+        for (const course of CONFIG.courses) {
+          if (state.manifest[course.id]) {
+            const courseHandle = await getNestedDir(state.semesterHandle, course.folderName);
+            await generateReadme(courseHandle, course.folderName, state.manifest[course.id]);
+          }
         }
-      }
-      log('  READMEs generated');
+        log('  READMEs generated');
 
-      await generateExcel(state.semesterHandle, skipQueue);
+        await generateExcel(state.semesterHandle, skipQueue);
 
-      // Summary
-      log('');
-      log('╔══════════════════════════════════╗');
-      log('║        SYNC COMPLETE             ║');
-      log('╚══════════════════════════════════╝');
-      log(`Mode: ${mode}`);
-      log(`Downloaded: ${downloaded}`);
-      log(`Failed: ${failed}`);
-      log(`Skipped: ${skipQueue.length}`);
-      log('');
-      for (const course of CONFIG.courses) {
-        const m = state.manifest[course.id];
-        const count = m ? Object.keys(m.items).length : 0;
-        log(`  ${course.folderName}: ${count} items`);
-      }
-      log('');
-      log('Done!');
+        // Summary
+        log('');
+        log('╔══════════════════════════════════╗');
+        log('║        SYNC COMPLETE             ║');
+        log('╚══════════════════════════════════╝');
+        log(`Mode: ${mode}`);
+        log(`Downloaded: ${downloaded}`);
+        log(`Failed: ${failed}`);
+        log(`Skipped: ${skipQueue.length}`);
+        log('');
+        for (const course of CONFIG.courses) {
+          const m = state.manifest[course.id];
+          const count = m ? Object.keys(m.items).length : 0;
+          log(`  ${course.folderName}: ${count} items`);
+        }
+        log('');
+        log('Done!');
 
-      state.results = { downloaded, failed, skipped: skipQueue.length };
-      state.skipQueue = skipQueue;
+        state.results = { downloaded, failed, skipped: skipQueue.length };
+        state.skipQueue = skipQueue;
+
+        // Desktop notification so unattended scheduled syncs are visible
+        try {
+          if (Notification.permission === 'granted') {
+            new Notification('Moodle Sync Complete', {
+              body: `${downloaded} downloaded, ${failed} failed, ${skipQueue.length} skipped`,
+              icon: '📚',
+            });
+          } else if (Notification.permission !== 'denied') {
+            Notification.requestPermission();
+          }
+        } catch {}
+      } // end if dryRun/else
 
     } catch (e) {
       log(`FATAL ERROR: ${e.message}`);
       log(e.stack || '');
     } finally {
       state.running = false;
+      // S9 — Release persistent sync lock (skip for dry runs — no lock was acquired)
+      if (!dryRun) {
+        try { await releaseSyncLock(); } catch {}
+      }
       // Re-enable buttons
       const seedBtn = document.getElementById('sync-seed');
       const incBtn = document.getElementById('sync-incremental');
+      const dryBtn = document.getElementById('sync-dryrun');
       if (seedBtn) seedBtn.disabled = false;
       if (incBtn) incBtn.disabled = false;
+      if (dryBtn) dryBtn.disabled = false;
       updateUI();
     }
   }
@@ -1345,7 +1662,7 @@
     container.innerHTML = `
       <div style="padding:16px 18px;background:linear-gradient(135deg,#1565C0,#1976D2);color:white;">
         <h2 style="margin:0;font-size:18px;font-weight:700;">BGU Moodle Sync</h2>
-        <p style="margin:4px 0 0;opacity:0.8;font-size:11px;">v2.3 — One-click course material sync (S1–S6 + update/removal detection)</p>
+        <p style="margin:4px 0 0;opacity:0.8;font-size:11px;">v2.6 — One-click course material sync (S1–S11 + Excel merge, retry, progress bar)</p>
       </div>
       <div style="padding:14px 18px;display:flex;gap:10px;">
         <button id="sync-seed" style="flex:1;padding:12px 8px;background:#2E7D32;color:white;border:none;border-radius:8px;font-size:13px;cursor:pointer;font-weight:600;transition:opacity .15s;">
@@ -1353,6 +1670,11 @@
         </button>
         <button id="sync-incremental" style="flex:1;padding:12px 8px;background:#E65100;color:white;border:none;border-radius:8px;font-size:13px;cursor:pointer;font-weight:600;transition:opacity .15s;">
           🔄 Incremental Sync
+        </button>
+      </div>
+      <div style="padding:0 18px 10px;display:flex;gap:10px;">
+        <button id="sync-dryrun" style="flex:1;padding:8px 8px;background:#6A1B9A;color:white;border:none;border-radius:8px;font-size:12px;cursor:pointer;font-weight:600;transition:opacity .15s;">
+          🔍 Dry Run (Preview)
         </button>
       </div>
       <div id="sync-status" style="padding:8px 18px;background:#E3F2FD;font-weight:600;color:#1565C0;font-size:12px;">
@@ -1375,13 +1697,22 @@
     document.getElementById('sync-seed').onclick = () => {
       document.getElementById('sync-seed').disabled = true;
       document.getElementById('sync-incremental').disabled = true;
+      document.getElementById('sync-dryrun').disabled = true;
       runSync('seed').catch(e => log('FATAL: ' + e.message));
     };
 
     document.getElementById('sync-incremental').onclick = () => {
       document.getElementById('sync-seed').disabled = true;
       document.getElementById('sync-incremental').disabled = true;
+      document.getElementById('sync-dryrun').disabled = true;
       runSync('incremental').catch(e => log('FATAL: ' + e.message));
+    };
+
+    document.getElementById('sync-dryrun').onclick = () => {
+      document.getElementById('sync-seed').disabled = true;
+      document.getElementById('sync-incremental').disabled = true;
+      document.getElementById('sync-dryrun').disabled = true;
+      runSync('incremental', { dryRun: true }).catch(e => log('FATAL: ' + e.message));
     };
   }
 
@@ -1477,11 +1808,13 @@
       // Enable buttons
       document.getElementById('sync-seed').disabled = false;
       document.getElementById('sync-incremental').disabled = false;
+      document.getElementById('sync-dryrun').disabled = false;
     };
 
     // Disable sync buttons until config is saved
     document.getElementById('sync-seed').disabled = true;
     document.getElementById('sync-incremental').disabled = true;
+    document.getElementById('sync-dryrun').disabled = true;
   }
 
   // ============================================================
@@ -1494,7 +1827,7 @@
     const configLoaded = await loadConfig();
 
     if (configLoaded && CONFIG.courses.length > 0) {
-      log(`Sync engine v2.3 loaded. ${CONFIG.courses.length} courses configured.`);
+      log(`Sync engine v2.6 loaded. ${CONFIG.courses.length} courses configured.`);
       log('Choose a mode to begin.');
     } else {
       log('No config found — showing setup form...');

@@ -112,7 +112,7 @@ If you use [Claude Desktop](https://claude.ai) with the Claude in Chrome extensi
 
 | File | Purpose |
 |------|---------|
-| `moodle_sync.js` | The sync engine (v2.3, with safety patches S1–S6 + update/removal detection). Paste into Chrome console. |
+| `moodle_sync.js` | The sync engine (v2.6, with safety patches S1–S11, Excel merge, download retry, progress bar). Paste into Chrome console. |
 | `moodle_sync_config.json` | Your personal config (courses, paths). **Not tracked in git** — create your own. The `semesterAbsolutePath` and `syncScriptPath` fields are only used by the scheduled task — update them to match your machine. |
 | `moodle_sync_spec.md` | Full technical spec with all rules and edge cases. Read this if you want to understand or modify the engine. |
 | `moodle-course-setup-SKILL.md` | Claude Desktop skill file for guided setup. |
