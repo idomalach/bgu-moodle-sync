@@ -694,16 +694,16 @@ The entire download pipeline is encoded in a single JavaScript file (`moodle_syn
 1. Navigate to any `moodle.bgu.ac.il` page in Chrome (must be logged in).
 2. Load the engine. Two options:
    - **Manual (console):** Paste the contents of `moodle_sync.js` into the browser console.
-   - **Automated (Claude in Chrome):** First inject the config via `javascript_tool`, then load the engine via `fetch()` from GitHub:
+   - **Automated (Claude in Chrome / scheduled task):** Read the config and engine from the local filesystem, then inject both into the Moodle tab via `javascript_tool`:
      ```javascript
-     // Inject config first
+     // 1. Inject config (read from local moodle_sync_config.json)
      window.__MOODLE_SYNC_CONFIG__ = { /* ... config JSON ... */ };
-     // Then load engine from GitHub (do NOT inject the 47KB script directly — it corrupts during chunked transcription)
-     fetch('https://raw.githubusercontent.com/idomalach/bgu-moodle-sync/main/moodle_sync.js')
-       .then(r => r.text()).then(code => eval(code));
+     // 2. Inject engine (read from local moodle_sync.js, then eval)
+     eval(engineCode);
      ```
+     The local filesystem is the source of truth. The GitHub repo (`github.com/idomalach/bgu-moodle-sync`) is for open-source distribution only, not for runtime use.
 3. A sidebar appears on the right with two buttons: **Seed Run (Full)** and **Incremental Sync**.
-4. Click one. The browser's directory picker opens — point it to the root download folder (the parent of `שנה ג׳`).
+4. Click one. On the first run, the browser's directory picker opens — point it to the root download folder (the parent of `שנה ג׳`). The handle is cached in IndexedDB (S3 patch), so subsequent runs skip the picker automatically.
 5. The engine scrapes all 5 courses, resolves URLs, expands folders, downloads files, saves the manifest, generates READMEs, and produces the Excel log. All automatically.
 
 ### Architecture (8-step pipeline)

@@ -111,7 +111,7 @@ If you use [Claude Desktop](https://claude.ai) with the Claude in Chrome extensi
 
 | File | Purpose |
 |------|---------|
-| `moodle_sync.js` | The sync engine. Paste into Chrome console. |
+| `moodle_sync.js` | The sync engine (v2.2, with safety patches S1–S6). Paste into Chrome console. |
 | `moodle_sync_config.json` | Your personal config (courses, paths). **Not tracked in git** — create your own. |
 | `moodle_sync_spec.md` | Full technical spec with all rules and edge cases. Read this if you want to understand or modify the engine. |
 | `moodle-course-setup-SKILL.md` | Claude Desktop skill file for guided setup. |
@@ -122,7 +122,7 @@ If you use [Claude Desktop](https://claude.ai) with the Claude in Chrome extensi
 - **BGU admin syllabi** (`bgu4u.bgu.ac.il`) require an SSO session on that domain. The engine logs these — you can download them manually by right-clicking the link on Moodle and opening in a new tab (repeat if redirected).
 - **RAR files** are saved as-is (no browser-based RAR extraction). ZIP files are extracted automatically.
 - **Video links** (YouTube, Zoom recordings) are skipped — they're noted in the Excel log.
-- The browser's folder picker requires one click per sync session. This is a Chrome security requirement and can't be bypassed.
+- The browser's folder picker appears on the first run only. After that, the directory handle is cached in IndexedDB and reused automatically — no repeated clicks needed.
 
 ## FAQ
 
